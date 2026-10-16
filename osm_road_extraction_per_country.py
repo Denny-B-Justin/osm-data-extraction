@@ -27,6 +27,10 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
+# MAGIC %sh vmstat 5 3; free -g
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## 1. Parameters (widgets / job parameters)
 

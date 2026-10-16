@@ -371,7 +371,7 @@ def discover_extracts() -> list:
         out.append(Extract(name, p, st.st_size, int(st.st_mtime), snap))
     if len({e.name for e in out}) != len(out):
         raise ValueError("Two source files map to the same extract name; rename one of them.")
-    return sorted(out, key=lambda e: -e.size)   # biggest first
+    return sorted(out, key=lambda e: e.size)   # biggest last
 
 
 OSMIUM = ensure_osmium()
@@ -862,6 +862,233 @@ display(pd.DataFrame(COUNTRIES)[["key", "iso2", "name", "table"]].head(20))
 
 # COMMAND ----------
 
+# # ── B. Chunk-level resume ─────────────────────────────────────────────────────────────────────────────────
+# # Paste after the "Road functions" cell; run it right before the "Run" cell (it starts the time budget).
+# #
+# # What changes compared with the original process_extract():
+# #   1. A file that is not finished is no longer wiped. The parquet parts already staged are validated
+# #      (a truncated last file is dropped), osmium is started again from the beginning of the file, and the first
+# #      N chunks are read and discarded instead of being processed. Chunk i is always staged as part-i.
+# #   2. The last discarded chunk is compared with the last staged part (same way ids) – if the stream is not
+# #      the same as before, the run stops instead of writing duplicates.
+# #   3. A stale node-index file is deleted before osmium starts (a leftover file would be reused by osmium).
+# #   4. HOURS_BUDGET: the run stops cleanly after the chunk that ends past the budget, never in the middle of a write.
+# #   5. The log line shows how the time splits between waiting for osmium and processing/writing.
+# #   6. The filtered PBF is cached in the Volume, so a new cluster skips the 18–27 min `tags-filter` step.
+ 
+# HOURS_BUDGET = 28.0       # cluster limit is 30 h; the 2 h margin covers the start-up and the final chunk
+# DEADLINE = time.time() + HOURS_BUDGET * 3600
+ 
+# FILTER_CACHE = f"{STAGING}/filtered_cache"
+# os.makedirs(FILTER_CACHE, exist_ok=True)
+ 
+ 
+# class OutOfTime(RuntimeError):
+#     """Raised on purpose when the time budget is used up. Progress is saved; re-run the notebook to continue."""
+ 
+ 
+# def _cache_filtered(out: str, cached: str) -> None:
+#     ok = cached + ".ok"
+#     try:
+#         if os.path.exists(ok) and os.path.exists(cached) and os.path.getsize(cached) == int(open(ok).read().strip()):
+#             return
+#         shutil.copyfile(out, cached)
+#         with open(ok, "w") as fh:
+#             fh.write(str(os.path.getsize(out)))
+#     except (OSError, ValueError) as e:
+#         log.warning(f"could not cache the filtered PBF in the Volume: {e}")
+ 
+ 
+# def ensure_filtered(ex: Extract) -> str:
+#     """Road ways (and their nodes) → local PBF; restored from the Volume cache when a new cluster has none."""
+#     out = filtered_path(ex)
+#     cached = f"{FILTER_CACHE}/{os.path.basename(out)}"
+#     if os.path.exists(out):
+#         _cache_filtered(out, cached)
+#         return out
+#     ok = cached + ".ok"
+#     try:
+#         if os.path.exists(ok) and os.path.getsize(cached) == int(open(ok).read().strip()):
+#             t0 = time.time()
+#             tmp = out.replace(".osm.pbf", ".tmp.osm.pbf")
+#             shutil.copyfile(cached, tmp)
+#             os.replace(tmp, out)
+#             log.info(f"[{ex.name}] filtered PBF restored from the Volume cache in {(time.time() - t0) / 60:.1f} min")
+#             return out
+#     except (OSError, ValueError):
+#         pass
+#     tmp = out.replace(".osm.pbf", ".tmp.osm.pbf")
+#     t0 = time.time()
+#     run_cmd([OSMIUM, "tags-filter", ex.path, f"w/highway={','.join(HIGHWAY_TAGS)}", "-o", tmp, "-O"],
+#             f"[{ex.name}] osmium tags-filter")
+#     os.replace(tmp, out)
+#     log.info(f"[{ex.name}] filtered {ex.size / 1e9:.1f} GB → {os.path.getsize(out) / 1e9:.2f} GB "
+#              f"in {(time.time() - t0) / 60:.1f} min")
+#     _cache_filtered(out, cached)
+#     return out
+ 
+ 
+# def _staged_parts(out_dir: str, meta: dict):
+#     """Names of the readable, contiguous part-00000… files already in out_dir (a truncated tail is deleted).
+#     Returns None when the staged data belongs to a different source file / boundary version."""
+#     meta_path = f"{out_dir}/_resume_meta.json"
+#     if os.path.exists(meta_path):
+#         with open(meta_path) as fh:
+#             old = json.load(fh)
+#         if any(old.get(k) != v for k, v in meta.items()):
+#             return None
+#     names = sorted(n for n in os.listdir(out_dir) if re.fullmatch(r"part-\d{5}\.parquet", n))
+#     good = []
+#     for i, n in enumerate(names):
+#         if n != f"part-{i:05d}.parquet":
+#             break
+#         good.append(n)
+#     while good:                                   # the file being copied when the run was stopped may be cut short
+#         try:
+#             pq.read_table(f"{out_dir}/{good[-1]}", columns=["osm_id"])
+#             break
+#         except Exception:
+#             good.pop()
+#     for n in names[len(good):]:
+#         os.remove(f"{out_dir}/{n}")
+#     return good
+ 
+ 
+# def _count_true(arr) -> int:
+#     return int(pc.sum(pc.fill_null(arr, False).cast(pa.int64())).as_py() or 0)
+ 
+ 
+# def process_extract(ex: Extract, export_cfg: str) -> dict:
+#     """Roads of one PBF file → staging Parquet. Finished files are skipped (marker); an unfinished file continues
+#     after its last fully staged chunk."""
+#     m = read_marker("roads", ex.name)
+#     if m and m.get("signature") == ex.signature and m.get("boundary_fingerprint") == BOUNDARY_FINGERPRINT:
+#         return {"extract": ex.name, "status": "skipped (done earlier)", **m.get("stats", {})}
+#     t0 = time.time()
+#     filtered = ensure_filtered(ex)
+#     out_dir = f"{ROADS_STAGING}/extract={ex.name}"
+#     chunk_bytes = int(CFG["read_chunk_mb"]) << 20
+#     meta = {"signature": ex.signature, "boundary_fingerprint": BOUNDARY_FINGERPRINT, "chunk_bytes": chunk_bytes}
+ 
+#     good = _staged_parts(out_dir, meta) if os.path.isdir(out_dir) else []
+#     if good is None:
+#         log.warning(f"[{ex.name}] staged parts come from a different source file or boundary version → starting over")
+#         rm_tree(out_dir)
+#         good = []
+#     os.makedirs(out_dir, exist_ok=True)
+#     with open(f"{out_dir}/_resume_meta.json", "w") as fh:
+#         json.dump(meta, fh)
+#     n_skip = len(good)
+ 
+#     stats = Counter()
+#     for n in good:                                # statistics of the chunks that are already staged
+#         t = pq.read_table(f"{out_dir}/{n}", columns=["osm_id", "osm_ts", "boundary_match"])
+#         stats["rows"] += t.num_rows
+#         stats["ways"] += len(pc.unique(t["osm_id"]))
+#         stats["nearest"] += _count_true(pc.equal(t["boundary_match"], "nearest"))
+#         stats["unassigned"] += t["boundary_match"].null_count
+#         stats["no_timestamp"] += _count_true(pc.less_equal(pc.fill_null(t["osm_ts"], 0), 0))
+#     if n_skip:
+#         log.info(f"[{ex.name}] resuming: {n_skip} chunks / {stats['ways']:,} roads already staged; "
+#                  f"osmium re-reads them from the start of the file and they are skipped, not re-processed")
+ 
+#     index = CFG["node_index"]
+#     idx_file = None
+#     if index.endswith("_file_array"):
+#         idx_file = os.path.join(LOCAL_DIR, f"{ex.name}.nodes.idx")
+#         if os.path.exists(idx_file):
+#             os.remove(idx_file)                   # a leftover index would be reused (and appended to) by osmium
+#         index = f"{index},{idx_file}"
+#     cmd = [OSMIUM, "export", filtered, "-c", export_cfg, "-f", "geojsonseq",
+#            "--geometry-types=linestring", "-i", index, "-o", "-"]
+#     err_path = os.path.join(LOCAL_DIR, f"{ex.name}.export.stderr")
+#     part = n_skip
+#     t_wait = t_skip = t_proc = 0.0
+ 
+#     def flush(tbl):
+#         nonlocal part
+#         if tbl is None or tbl.num_rows == 0:
+#             return
+#         local = os.path.join(LOCAL_DIR, f"{ex.name}.part.parquet")
+#         pq.write_table(tbl, local, compression="zstd")
+#         shutil.copyfile(local, f"{out_dir}/part-{part:05d}.parquet")
+#         os.remove(local)
+#         part += 1
+ 
+#     def verify_alignment(data: bytes):
+#         """The last skipped chunk must hold exactly the ways of the last staged part."""
+#         t = read_geojson_lines(data)
+#         raw = set(t.column("properties").combine_chunks().field("@id").drop_null().to_pylist())
+#         staged = set(pq.read_table(f"{out_dir}/part-{n_skip - 1:05d}.parquet", columns=["osm_id"])["osm_id"].to_pylist())
+#         if not staged <= raw or len(staged) < 0.999 * len(raw):
+#             raise RuntimeError(
+#                 f"[{ex.name}] the osmium stream does not match what was staged before "
+#                 f"({len(staged):,} staged ways vs {len(raw):,} in the chunk, {len(staged - raw):,} staged ids missing). "
+#                 "Resuming would create duplicates. Restore the original settings/files, or use mode=force.")
+ 
+#     with open(err_path, "wb") as err:
+#         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, bufsize=1 << 20)
+#         try:
+#             rest, last_log, chunk_i = b"", time.time(), 0
+#             while True:
+#                 tw = time.time()
+#                 chunk = proc.stdout.read(chunk_bytes)
+#                 t_wait += time.time() - tw
+#                 if not chunk:
+#                     break
+#                 data = rest + chunk
+#                 cut = data.rfind(b"\n") + 1
+#                 rest = data[cut:]
+#                 if cut:
+#                     tp = time.time()
+#                     if chunk_i < n_skip:
+#                         if chunk_i == n_skip - 1:
+#                             verify_alignment(data[:cut])
+#                         t_skip += time.time() - tp
+#                     else:
+#                         flush(process_chunk(data[:cut], stats))
+#                         t_proc += time.time() - tp
+#                     chunk_i += 1
+#                     if chunk_i > n_skip and time.time() > DEADLINE:
+#                         raise OutOfTime(f"[{ex.name}] time budget of {HOURS_BUDGET:g} h used up after {chunk_i} chunks "
+#                                         f"({stats['ways']:,} roads staged). Progress is saved; run again to continue.")
+#                 if time.time() - last_log > 300:
+#                     log.info(f"[{ex.name}] {stats['ways']:,} roads so far ({(time.time() - t0) / 60:.0f} min; "
+#                              f"waiting for osmium {t_wait / 60:.0f} min, skipping {t_skip / 60:.0f} min, "
+#                              f"processing+writing {t_proc / 60:.0f} min)")
+#                     last_log = time.time()
+#             if rest.strip() and chunk_i >= n_skip:
+#                 tp = time.time()
+#                 flush(process_chunk(rest + b"\n", stats))
+#                 t_proc += time.time() - tp
+#             rc = proc.wait()
+#         except BaseException:
+#             proc.kill()
+#             proc.wait()
+#             raise
+#     if rc != 0:
+#         with open(err_path, "rb") as fh:
+#             tail = fh.read()[-2000:].decode("utf-8", "ignore")
+#         raise RuntimeError(f"[{ex.name}] osmium export failed (exit {rc}): {tail}")
+#     for f in (idx_file, err_path):
+#         if f and os.path.exists(f):
+#             os.remove(f)
+#     if not CFG["keep_local_files"] and os.path.exists(filtered):
+#         os.remove(filtered)
+#     for f in (f"{FILTER_CACHE}/{os.path.basename(filtered_path(ex))}", f"{FILTER_CACHE}/{os.path.basename(filtered_path(ex))}.ok"):
+#         if os.path.exists(f):
+#             os.remove(f)
+#     stats = dict(stats, parquet_files=part)
+#     write_marker("roads", ex.name, {"signature": ex.signature, "boundary_fingerprint": BOUNDARY_FINGERPRINT,
+#                                     "snapshot": ex.snapshot, "stats": stats})
+#     return {"extract": ex.name, "status": f"done in {(time.time() - t0) / 60:.1f} min", **stats}
+ 
+ 
+# print(f"✅ Resume patch loaded. Time budget: {HOURS_BUDGET:g} h from now.")
+ 
+
+# COMMAND ----------
+
 def filtered_path(ex: Extract) -> str:
     return os.path.join(LOCAL_DIR, f"{ex.name}.{ex.signature}.filtered.osm.pbf")
 
@@ -1147,7 +1374,17 @@ print("✅ Road functions defined.")
 
 # COMMAND ----------
 
+# # ── C. Duplicate check on the staged parquet (run after the Run cell, or any time between sessions) ──────────
+# # Within one extract, every (osm_id, country_iso3) pair must appear exactly once.
+# _df = spark.read.option("basePath", ROADS_STAGING).parquet(f"{ROADS_STAGING}/extract=north-america")   # change the name for europe
+# _tot = _df.count()
+# _uniq = _df.select("osm_id", "country_iso3").distinct().count()
+# print(f"rows {_tot:,}  unique (osm_id, country) {_uniq:,}  duplicates {_tot - _uniq:,}")
+
+# COMMAND ----------
+
 EXPORT_CFG = export_config_path()
+# AFRICA_EXTRACT = Extract(name='africa', path='/Volumes/prd_mega/saiana95/vaiana95/OSM/geofabrik/africa-latest.osm.pbf', size=7922432239, mtime=1790397688, snapshot='2026-09-25T20:24:36Z')
 ROAD_RESULTS = run_parallel(lambda ex: process_extract(ex, EXPORT_CFG), EXTRACTS, "roads")
 ROAD_EXTRACTS = [ex for ex in EXTRACTS
                  if (read_marker("roads", ex.name) or {}).get("boundary_fingerprint") == BOUNDARY_FINGERPRINT]
@@ -1480,3 +1717,40 @@ display(spark.sql(f"""
     GROUP BY ALL
     ORDER BY country_iso3, boundary_match, highway_class, surface_type
 """))
+
+# COMMAND ----------
+
+# ── A. Benchmark osmium alone (needs the filtered Asia PBF still on local disk) ───────────────────────────
+# Reads ~2 GB of GeoJSON from osmium and throws it away: no Python processing involved.
+# The current run manages roughly 0.2 MB/s end to end, so anything above ~10 MB/s means osmium is not the bottleneck.
+import glob, os, subprocess, time
+ 
+def bench_osmium(index: str, nbytes: int = 2_000_000_000):
+    files = sorted(glob.glob(f"{LOCAL_DIR}/asia.*.filtered.osm.pbf"))
+    if not files:
+        print("No filtered Asia PBF on local disk (cluster was restarted?). Skip this benchmark.")
+        return
+    cmd = [OSMIUM, "export", files[0], "-c", EXPORT_CFG, "-f", "geojsonseq",
+           "--geometry-types=linestring", "-i", index, "-o", "-"]
+    t0, got = time.time(), 0
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    while got < nbytes:
+        b = p.stdout.read(64 << 20)
+        if not b:
+            break
+        got += len(b)
+    p.kill(); p.wait()
+    dt = time.time() - t0
+    print(f"{index.split(',')[0]:<18} {got / 1e6:,.0f} MB in {dt:,.0f} s  →  {got / 1e6 / dt:,.1f} MB/s (includes the node-loading pass)")
+ 
+_bench_idx = f"{LOCAL_DIR}/bench.nodes.idx"
+for _f in (_bench_idx,):
+    if os.path.exists(_f):
+        os.remove(_f)
+bench_osmium("flex_mem")                           # node index in RAM
+bench_osmium(f"sparse_file_array,{_bench_idx}")    # what the notebook uses now (index on disk)
+if os.path.exists(_bench_idx):
+    os.remove(_bench_idx)
+ 
+# While a run is going, `vmstat 5 3` in a %sh cell shows the picture too: a high `wa` (I/O wait) column
+# together with a low CPU use for the osmium process points at the on-disk node index.
