@@ -355,6 +355,8 @@ COUNTRIES = [
     ("ZW",  "Zimbabwe",                           "africa",                 "zimbabwe"),
 ]
 
+COUNTRIES = [("DE",  "Germany", "europe", "germany"),]
+
 # Geofabrik extracts that cover more than one code. The whole extract is written
 # to the table of every code that uses it, so those tables also hold the
 # neighbouring territories' roads (this is added to the log as a note).
