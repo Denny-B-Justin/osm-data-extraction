@@ -1,255 +1,356 @@
-# OSM Road Extraction — one table and one CSV per country
+# OSM Roads by Country using Geofabrik
 
-`osm_road_extraction_per_country.py` is a Databricks notebook. It downloads OpenStreetMap roads (`highway=*` ways) edited since a given date, for every country in the world. For each country it:
+Three Databricks notebooks that turn OpenStreetMap country extracts from [Geofabrik](https://download.geofabrik.de) into data that is ready to use:
 
-1. writes a Delta table, `prd_mega.sgpbpi163.<country>_osm_road`, and
-2. exports the same data as CSV to a Unity Catalog Volume.
+| Step | Notebook | Result |
+|---|---|---|
+| 1 | [`01_osm_geofabrik_roads.py`](01_osm_geofabrik_roads.py) | One Unity Catalog table of road lines per country |
+| 2 | [`02_osm_roads_build_zips.py`](02_osm_roads_build_zips.py) | One downloadable zip of CSV files per country, plus a `manifest.json` that lists them |
+| 3 | [`03_osm_roads_coverage_analysis.py`](03_osm_roads_coverage_analysis.py) | One CSV with the road length in km for every country, split by road kind |
 
-Both happen as soon as that country finishes. Nothing builds up in driver memory, and every step is checkpointed. An interrupted run can be resumed without downloading anything twice.
+Run them in this order. Notebooks 02 and 03 both read the tables that notebook 01 creates.
 
 ---
 
 ## Contents
 
+- [Pipeline at a glance](#pipeline-at-a-glance)
 - [What it produces](#what-it-produces)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
-- [Parameters](#parameters)
-- [Configuration (`CFG`)](#configuration-cfg)
-- [How it works](#how-it-works)
-- [Output schema](#output-schema)
-- [CSV files](#csv-files)
-- [Resuming, refreshing and retrying](#resuming-refreshing-and-retrying)
-- [Monitoring a run](#monitoring-a-run)
+- [Notebook 01: extract roads into tables](#notebook-01-extract-roads-into-tables)
+- [Notebook 02: build one zip per country](#notebook-02-build-one-zip-per-country)
+- [Notebook 03: road coverage in km](#notebook-03-road-coverage-in-km)
+- [Shared extracts](#shared-extracts)
+- [Refreshing the data](#refreshing-the-data)
 - [Troubleshooting](#troubleshooting)
 - [Known limitations](#known-limitations)
-- [Changes from the previous notebook](#changes-from-the-previous-notebook)
+
+---
+
+## Pipeline at a glance
+
+```mermaid
+flowchart LR
+    G["Geofabrik<br/>country .osm.pbf"] --> N1["01<br/>extract roads"]
+    N1 --> T[("osm_geofabrik_XX<br/>one table per country")]
+    N1 --> L[("osm_geofabrik_run_log")]
+    B[("cbd_world_boundaries_dissolved")] --> N2
+    B --> N3
+    T --> N2["02<br/>build zips"]
+    T --> N3["03<br/>coverage in km"]
+    N2 --> Z["XX_roads.zip<br/>+ manifest.json"]
+    N3 --> C["00_countrywise_road_<br/>coverage_analysis.csv"]
+```
+
+`XX` is the lower-case ISO 3166-1 alpha-2 country code (for example `la` for Laos).
+
+The boundary table is only used for countries that Geofabrik ships inside a multi-country extract. See [Shared extracts](#shared-extracts).
 
 ---
 
 ## What it produces
 
-| Output | Location | Purpose |
+| Output | Location | Written by |
 |---|---|---|
-| Country tables | `prd_mega.sgpbpi163.<country>_osm_road` | Final data, one Delta table per country (e.g. `bolivia_osm_road`, `democratic_republic_of_the_congo_osm_road`) |
-| Country CSVs | `/Volumes/prd_mega/sgpbpi163/vgpbpi163/OSM/extraction/osm_road_csv/` | Same data as the table: `<country>_osm_road.csv`, or `_part001.csv`, `_part002.csv`, … for large countries |
-| Run log | `prd_mega.sgpbpi163.osm_road_extraction_log` | One row per country attempt: status, row count, errors, CSV paths, duration |
-| Tile log | `prd_mega.sgpbpi163.osm_road_tile_log` | Per-tile checkpoints used by `resume` |
-| Staging | `prd_mega.sgpbpi163.osm_road_staging` | Scratch rows for countries in progress; each country's rows are removed once it is published |
-| All-countries view | `prd_mega.sgpbpi163.osm_road_all` | `UNION ALL` of every published country table, used by the summary cells |
-
-250 territories are covered: every ISO 3166-1 code in `pycountry`, plus Kosovo (`XK`).
+| Country tables | `prd_mega.sgpbpi163.osm_geofabrik_<iso2>` | 01 |
+| Run log | `prd_mega.sgpbpi163.osm_geofabrik_run_log` | 01 |
+| Cached Geofabrik downloads | `/Volumes/prd_mega/sgpbpi163/vgpbpi163/OSM/geofabrik_country/<name>-latest.osm.pbf` | 01 |
+| Country zips | `/Volumes/prd_mega/sgpbpi163/vgpbpi163/OSM/osm_road_all_country/<iso2>_roads.zip` | 02 |
+| Manifest | `/Volumes/prd_mega/sgpbpi163/vgpbpi163/OSM/osm_road_all_country/manifest.json` | 02 |
+| Coverage CSV | `/Volumes/prd_mega/sgpbpi163/vgpbpi163/OSM/geofabrik_country/00_countrywise_road_coverage_analysis.csv` | 03 |
 
 ---
 
 ## Requirements
 
 **Databricks**
-- Databricks Runtime 13.3 LTS or newer. Unity Catalog clusters, single-user or shared, and serverless all work.
-- Privileges:
-  - `USE CATALOG` on `prd_mega`
-  - `USE SCHEMA`, `CREATE TABLE`, `MODIFY` and `SELECT` on `prd_mega.sgpbpi163`
-  - `WRITE VOLUME` on `prd_mega.sgpbpi163.vgpbpi163` (only if CSV export is on)
+- A Unity Catalog workspace. The notebooks use catalog `prd_mega`, schema `sgpbpi163` and volume `vgpbpi163`.
+- Privileges: `USE CATALOG` on `prd_mega`; `USE SCHEMA`, `CREATE TABLE`, `MODIFY` and `SELECT` on `prd_mega.sgpbpi163`; `READ VOLUME` and `WRITE VOLUME` on `prd_mega.sgpbpi163.vgpbpi163`.
+- Enough local disk on the driver. Notebook 01 copies each country's `.osm.pbf` there to parse it, and the largest countries are several GB. Notebooks 02 and 03 work from the tables, not the PBFs.
 
-**Network**
+**Network** (notebook 01 only)
+- Outbound HTTPS to `download.geofabrik.de`.
+- `wget` on the cluster, which Databricks Runtime provides.
 
-The cluster needs outbound HTTPS access to:
-- `overpass-api.de`, `overpass.private.coffee`, `overpass.kumi.systems`, `maps.mail.ru`. These are the Overpass servers. At least one must be reachable.
-- `nominatim.openstreetmap.org`. This is optional. It is only used for the outlines of large countries and as a name-based fallback.
+**Input table** (notebooks 02 and 03)
+- `prd_mega.sgpbpi163.cbd_world_boundaries_dissolved` with the columns `iso_a3` and `geometry_json` (GeoJSON). It holds the World Bank official country boundaries.
 
 **Python packages**
 
-The first cell installs these; nothing else is needed:
+The first cell of each notebook installs what it needs:
 
-```
-pycountry>=22.3.5   ijson>=3.2   shapely>=2.0   pyproj>=3.4
-```
+| Notebook | Packages |
+|---|---|
+| 01 | `osmium` |
+| 02 | `numpy<2`, `shapely` |
+| 03 | `numpy<2`, `shapely`, `pyproj` |
 
-GeoPandas and osmnx are **not** used.
+All settings are plain constants in the **Settings** cell of each notebook. There are no widgets.
 
 ---
 
 ## Quick start
 
-1. **Import** the notebook: *Workspace → Import → File →* `osm_road_extraction_per_country.py`. It opens as a notebook with numbered sections.
-2. **Test on a few countries first.** Set the `countries` widget to e.g. `LU,BO,BJ`, then *Run all*. Check the pre-flight cell (section 10). It shows which Overpass servers are reachable and whether the Volume is writable.
-3. **Run the full extraction as a Job.** A full run takes many hours, and a Job survives browser disconnects and notebook timeouts.
-   - *Workflows → Create job → Notebook task →* select the notebook.
-   - Add the job parameters `since_date`, `countries` (empty), `mode` (`resume`) and `country_workers` (`3`).
-   - Use a single-node or small cluster. The work is network-bound, not compute-bound.
-4. **If the job stops or ends with failures**, run it again with `mode = resume`. Countries and tiles that already finished are skipped.
+1. **Get the notebooks into Databricks.** Add this repository as a Git folder, or use *Workspace → Import → File* for each `.py` file. They open as notebooks.
+2. **Smoke test on two countries.** In each notebook set `ONLY_ISO2 = ["LA", "BT"]` and run 01, then 02, then 03.
+3. **Check the results.**
+   - 01 prints `SUCCESS` per country and writes the run log.
+   - 02 prints the zip it published and ends with `N of N zips look right`.
+   - 03 ends with `CSV check passed`.
+4. **Run everything.** Set `ONLY_ISO2 = []` in all three notebooks and run them as a Databricks Job:
+   - *Workflows → Create job*, with three notebook tasks.
+   - Task 01 first. Tasks 02 and 03 each depend on 01 and can run in parallel.
+5. **Re-run any time.** Every notebook is safe to run again. See [Refreshing the data](#refreshing-the-data).
+
+> Notebook 03 overwrites its CSV on every run. A smoke test with `ONLY_ISO2` therefore replaces the full file with just those countries.
 
 ---
 
-## Parameters
+## Notebook 01: extract roads into tables
 
-Parameters are set as widgets in the notebook or as parameters in a Job.
+`01_osm_geofabrik_roads.py` downloads each country's Geofabrik extract and stores its roads in a Unity Catalog table.
 
-| Parameter | Default | Meaning |
-|---|---|---|
-| `since_date` | `2024-01-01T00:00:00Z` | Only ways whose last edit is on or after this UTC time are extracted. Format: `YYYY-MM-DDTHH:MM:SSZ`. |
-| `countries` | *(blank)* | Comma-separated ISO2 codes, e.g. `AT,BE,BR`. Blank means all countries. |
-| `mode` | `resume` | `resume` skips countries already completed for this `since_date` and continues partially done ones. `force` discards previous work for the selected countries and re-extracts them. |
-| `country_workers` | `3` | Number of countries processed in parallel. |
+For every country in `COUNTRIES` it:
 
----
+1. **Skips** the country if `prd_mega.sgpbpi163.osm_geofabrik_<iso2>` already exists. Nothing is logged for a skipped country.
+2. **Finds the extract.** The list holds the Geofabrik folder and file name for each country, giving `https://download.geofabrik.de/<folder>/<name>-latest.osm.pbf`. Countries without an entry of their own are looked up in Geofabrik's index by ISO-2 code. If Geofabrik has no extract, the country is logged as a failure.
+3. **Downloads** the `.osm.pbf` with `wget` into the Volume folder `.../OSM/geofabrik_country/`. A file that is already there is reused, so each extract is downloaded once. It is copied to local disk for parsing.
+4. **Extracts the roads in one pass** with pyosmium. Every way with a `highway` tag in the list below is kept, and its line is built as WKT text while parsing.
+5. **Appends the rows to the table in chunks** of 200,000 rows, so memory use stays flat for large countries.
+6. **Logs** success or failure to `osm_geofabrik_run_log`.
 
-## Configuration (`CFG`)
+The loop never stops on an error. A failed country is logged and the next one starts.
 
-`CFG` is a dictionary in section 1. The defaults are sensible; the settings you are most likely to change are listed here.
+**Road types kept** (`highway=` values):
 
-| Key | Default | Notes |
-|---|---|---|
-| `catalog_schema` | `prd_mega.sgpbpi163` | Where all tables are created |
-| `table_naming` | `"name"` | `"name"` gives `bolivia_osm_road`; `"iso3"` gives `bol_osm_road` |
-| `create_empty_tables` | `True` | Territories with no matching roads still get an empty table and a header-only CSV |
-| `csv_export` | `True` | Turn CSV export on or off |
-| `csv_volume_dir` | `/Volumes/prd_mega/sgpbpi163/vgpbpi163/OSM/extraction/osm_road_csv` | CSV destination folder (created if missing) |
-| `csv_max_rows_per_file` | `1_000_000` | Excel's row limit. Larger countries are split into `_partNNN` files. `None` gives one file per country. |
-| `csv_compression` | `None` | `"gzip"` makes files about 5× smaller, but Excel cannot open `.gz` files directly |
-| `overpass_endpoints` | 4 public servers | Order does not matter; unreachable servers are dropped at start-up |
-| `slots_per_endpoint` | `1` | Concurrent requests per server. Keep this low: public servers rate-limit per IP. |
-| `overpass_timeout_s` | `180` | Server-side timeout per tile query |
-| `initial_tile_deg` | `2.0` | Starting tile size. Changing it invalidates the resume checkpoints for this `since_date`. |
-| `max_split_depth` | `6` | A tile can be split down to about 0.03° |
-| `tile_workers_per_country` | `2` | Tiles fetched in parallel within one country |
-| `max_tile_attempts` | `10` | Retries per tile before the country is marked `FAILED` |
-| `write_batch_rows` | `50_000` | Rows per Delta append. Lower this if driver memory is tight. |
-| `final_retry_pass` | `True` | Retry failed countries once at the end, after a 300 s cool-down |
-| `force_ipv4` | `True` | Avoids misleading `[Errno 101] Network is unreachable` errors from failed IPv6 attempts |
+`motorway`, `trunk`, `primary`, `secondary`, `tertiary`, `unclassified`, `residential`, `service`, `motorway_link`, `trunk_link`, `primary_link`, `secondary_link`, `tertiary_link`, `living_street`, `track`, `road`.
 
----
+Footways, paths, cycleways, pedestrian streets, steps and bridleways are not included.
 
-## How it works
+**Countries.** `COUNTRIES` lists 234 ISO codes. 205 have a Geofabrik path of their own and 29 are looked up in Geofabrik's index. `AN` (Netherlands Antilles) and `CS` (Serbia and Montenegro) no longer exist as ISO codes and are logged as failures.
 
-```mermaid
-flowchart TD
-    A[Country ISO code] --> B[Find OSM boundary relation<br/>ISO3166-1 tag via Overpass]
-    B --> C[Overpass area id + bounding box]
-    C --> D[Cut bbox into 2° tiles<br/>drop tiles far from the country outline]
-    D --> E[Query tile on a healthy endpoint]
-    E -->|OK| F[Stream response to local disk<br/>parse way by way]
-    E -->|Timeout / out of memory| G[Split tile into 4] --> E
-    E -->|429 / 5xx / network error| H[Cool down endpoint,<br/>retry on another] --> E
-    F --> I[Append in 50k-row batches<br/>to staging Delta table]
-    I --> J{All tiles done?}
-    J -->|No| K[Country FAILED<br/>progress kept for resume]
-    J -->|Yes| L[Deduplicate on osm_id<br/>→ country Delta table]
-    L --> M[Spark writes CSV to Volume]
-    M --> N[Clear staging, write run log]
-```
+### Country table
 
-**Finding the country.** Countries are identified by the `ISO3166-1` tag on their OSM boundary relation, not by name. Queries are restricted to the country's Overpass *area*, so a neighbouring country's roads inside the bounding box are excluded. If Overpass has no area for the relation, the tile falls back to a bounding-box query and a warning is logged.
-
-**Tiling.** Tiles sit on a fixed global 2° grid, so tile ids (e.g. `g2_23_5`, split children `g2_23_5.0` … `.3`) are the same across runs. For countries spanning more than 12 tiles, tiles away from the country outline are skipped. The outline is a simplified shape from Nominatim, checked with a 0.25° margin.
-
-**Detecting silent failures.** Overpass reports a timeout or memory error as HTTP 200 with a `remark` field. The notebook checks for that remark and for cut-off responses, so a failed tile is never recorded as "no data".
-
-**Endpoint pool.** The four Overpass servers are health-checked at start-up. Load is spread across them with a politeness gap between requests. After a failure, a server is paused for an exponentially increasing time: 429 errors start at 60 s, other failures at 20 s, capped at 15 min. A server that turns out not to know a country's area is skipped for that tile.
-
-**Memory.** Each response is saved to local disk, then read one way at a time with `ijson`. Rows go to Delta every 50,000 ways. Driver memory therefore stays roughly constant, whatever the size of the country.
-
-**Publishing.** A way that crosses a tile edge is returned by every tile it touches. Publishing therefore deduplicates on `osm_id`, then overwrites the country table and exports the CSV.
-
----
-
-## Output schema
-
-Country tables and CSVs share these columns.
+`prd_mega.sgpbpi163.osm_geofabrik_<iso2>`
 
 | Column | Type | Description |
 |---|---|---|
 | `osm_id` | BIGINT | OSM way id |
-| `osm_version` | BIGINT | Way version |
-| `osm_timestamp` | TIMESTAMP | Last edit time of the way (UTC) |
-| `country_iso2`, `country_iso3`, `country_name` | STRING | Country the row was extracted for |
-| `highway` | STRING | Raw `highway=` value |
-| `highway_class` | STRING | Grouped class: motorway, trunk, primary, secondary, tertiary, residential, unclassified, service, pedestrian, track, path, other |
-| `surface_tag` | STRING | Raw `surface=` value |
-| `surface_type` | STRING | `paved` / `unpaved` / `unknown`. Taken from `surface=` if it is set, otherwise inferred from the highway type. |
-| `road_name` | STRING | `name=` |
-| `ref` | STRING | `ref=` (e.g. `A1`, `N7`) |
-| `lanes` | INT | `lanes=` if it is numeric |
-| `maxspeed_raw` | STRING | Raw `maxspeed=` value |
-| `maxspeed_kmh` | DOUBLE | Speed in km/h (mph and knots converted); null for values like `walk` or `RU:urban` |
-| `oneway` | STRING | `oneway=` (default `no`) |
-| `bridge`, `tunnel` | BOOLEAN | True unless the tag is absent or set to `no` / `false` / `0` |
-| `access` | STRING | `access=` |
-| `length_m`, `length_km` | DOUBLE | Geodesic length on the WGS84 ellipsoid |
-| `geometry_wkt` | STRING | `LINESTRING (lon lat, …)` in WGS84 (EPSG:4326) |
-| `since_date` | STRING | The `since_date` parameter used |
-| `run_id` | STRING | Run that produced the row |
-| `extracted_at` | TIMESTAMP | When the row was written |
+| `name` | STRING | `name=` tag, null if the way has none |
+| `kind` | STRING | The `highway=` value, e.g. `residential`, `tertiary`, `track` |
+| `geometry` | STRING | `LINESTRING (lon lat, lon lat, ...)` in WGS84 (EPSG:4326), 7 decimals |
+| `source_year` | BIGINT | The calendar year in which the notebook ran |
 
-Road types extracted: motorway, trunk, primary, secondary and tertiary (each with its `_link`), residential, living_street, unclassified, service, pedestrian, busway, track, path, footway, cycleway, bridleway, road.
+### Run log
 
----
+`prd_mega.sgpbpi163.osm_geofabrik_run_log` has one row per success or failure.
 
-## CSV files
-
-- UTF-8, comma-separated, with a header row. Quotes are doubled following RFC 4180, which pandas, Excel and QGIS all read correctly.
-- Timestamps are written as `YYYY-MM-DDTHH:MM:SSZ` (UTC).
-- Files are written by Spark directly from the Delta table, never through pandas or GeoPandas, so a large country cannot exhaust driver memory.
-- Each country's CSV is written to a temporary folder first. The country's previous files are replaced only after the new export succeeds.
-- To load a CSV as geometries:
-
-  ```python
-  import pandas as pd, geopandas as gpd
-  df = pd.read_csv("/Volumes/prd_mega/sgpbpi163/vgpbpi163/OSM/extraction/osm_road_csv/bolivia_osm_road.csv")
-  gdf = gpd.GeoDataFrame(df, geometry=gpd.GeoSeries.from_wkt(df["geometry_wkt"]), crs="EPSG:4326")
-  ```
-
-- In QGIS: *Layer → Add Delimited Text Layer → Geometry definition: WKT → field `geometry_wkt`, CRS EPSG:4326*.
-- For Excel with non-Latin road names, use *Data → From Text/CSV* and choose UTF-8. Double-clicking the file may show garbled characters.
-
----
-
-## Resuming, refreshing and retrying
-
-| Situation | What to do |
+| Column | Description |
 |---|---|
-| Job was cancelled, cluster died, some countries `FAILED` | Re-run with `mode = resume`. Completed countries are skipped. Partially done countries only fetch their missing tiles. |
-| Refresh specific countries | `countries = BR,IN`, `mode = force` |
-| New cut-off date | Change `since_date`. Resume state is tracked per `since_date`, so every country runs again and its table and CSV are overwritten. |
-| Tables exist but CSVs are missing (e.g. CSV export was off) | Run with `mode = resume`. Missing CSVs are exported from the existing tables before extraction starts. |
-| Recreate everything | Leave `countries` blank and set `mode = force` |
-
-At the end of each run, countries that failed are retried once more (`final_retry_pass`). Countries that still fail keep all their finished tiles for the next `resume`.
-
----
-
-## Monitoring a run
-
-The notebook prints one line per finished country (✅ success, ⚪ empty, ❌ failed, ❓ unresolved), plus progress for large countries every 2 minutes. You can also query the logs while a run is going.
+| `run_ts` | When the row was written (UTC) |
+| `iso2`, `country_name` | The country |
+| `status` | `success` or `failure` |
+| `uc_table` | The table written (success only) |
+| `row_count` | Number of roads written (success only) |
+| `reason` | Error text (failure only) |
+| `note` | For example a shared-extract warning |
 
 Latest status per country:
 
 ```sql
-SELECT * FROM (
-  SELECT *, ROW_NUMBER() OVER (PARTITION BY country_iso2 ORDER BY finished_at DESC) AS rn
-  FROM prd_mega.sgpbpi163.osm_road_extraction_log
-  WHERE since_date = '2024-01-01T00:00:00Z')
+SELECT iso2, country_name, status, row_count, reason, note, run_ts
+FROM (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY iso2 ORDER BY run_ts DESC) AS rn
+  FROM prd_mega.sgpbpi163.osm_geofabrik_run_log)
 WHERE rn = 1
-ORDER BY status, country_iso2;
+ORDER BY status, iso2;
 ```
 
-Tile progress for a country still running:
+### Settings
 
-```sql
-SELECT status, COUNT(*) AS tiles, SUM(row_count) AS rows
-FROM prd_mega.sgpbpi163.osm_road_tile_log
-WHERE country_iso2 = 'BR'
-GROUP BY status;
+| Setting | Default | Meaning |
+|---|---|---|
+| `CATALOG`, `SCHEMA`, `TABLE_PREFIX` | `prd_mega`, `sgpbpi163`, `osm_geofabrik_` | Where the tables are created |
+| `VOLUME_DIR` | `/Volumes/prd_mega/sgpbpi163/vgpbpi163/OSM/geofabrik_country/` | Where the downloaded PBFs are cached |
+| `FORCE_DOWNLOAD` | `False` | `True` downloads again even if the PBF is in the Volume. Geofabrik rebuilds `-latest` daily. |
+| `CHUNK_ROWS` | `200_000` | Rows buffered before each append to the table |
+| `BIG_PBF_BYTES` | 500 MB | Larger files use a node-location index on disk instead of RAM |
+| `ONLY_ISO2` | `[]` | Smoke test: list ISO-2 codes to process only those. Empty means all countries. |
+
+---
+
+## Notebook 02: build one zip per country
+
+`02_osm_roads_build_zips.py` turns every country table into a download for a web app.
+
+```
+/Volumes/prd_mega/sgpbpi163/vgpbpi163/OSM/osm_road_all_country/
+    vn_roads.zip       road_openstreetmap_vn_part00001.csv, ..._part00002.csv, ...  +  README.txt
+    ...
+    manifest.json      what is available: name, rows, parts, size, columns, dates
 ```
 
-**Country statuses**
+For every `osm_geofabrik_<iso2>` table it:
 
-| Status | Meaning |
+1. **Skips** the country when its zip is up to date. That means the table has not been rewritten since the last build, the build settings are the same, and the zip is still in the Volume.
+2. **Clips shared extracts.** For countries that Geofabrik ships inside a multi-country extract, only the roads that touch the country's World Bank boundary are kept. See [Shared extracts](#shared-extracts).
+3. **Writes CSV parts with Spark.** Each part has at most 200,000 rows. Rows are spread evenly in no particular order, so users must append all parts. Line breaks inside text values are replaced by a space, and quotes follow RFC 4180.
+4. **Zips and checks.** The parts are zipped on local disk with a `README.txt`. The row count of every part is checked against the table before the zip is published.
+5. **Publishes safely.** The zip is copied to the Volume under a temporary name and then renamed, so the app never sees a half-written file.
+6. **Updates `manifest.json` after every country**, so the app sees each new file as soon as it is ready.
+
+A failed country is reported and the loop continues. Its previous zip, if any, stays published.
+
+At the end the notebook opens every published zip and confirms its file names match the manifest.
+
+### CSV columns
+
+The CSVs have the same columns as the country table: `osm_id`, `name`, `kind`, `geometry`, `source_year`.
+
+### Manifest
+
+`manifest.json` has `manifest_version`, `updated_at`, `rows_per_part` and a `countries` object keyed by ISO-2 code. Each country entry holds:
+
+| Field | Meaning |
 |---|---|
-| `SUCCESS` | Table and CSV published |
-| `EMPTY` | Country found, but no matching roads edited since `since_date`. An empty table and a header-only CSV are created. |
-| `FAILED` | At least one tile, the boundary lookup, or the CSV export failed. The `error` and `failed_tiles` columns say why. Progress is kept. |
-| `UNRESOLVED` | OSM has no boundary relation for this ISO code (e.g. some uninhabited territories) |
+| `iso2`, `name` | The country |
+| `file`, `size_bytes` | The zip file name and size |
+| `rows`, `parts` | Total roads and number of CSV files in the zip |
+| `columns` | Column names of the CSVs |
+| `table` | Source table |
+| `extracted_at`, `built_at` | When the table was last written, and when the zip was built |
+| `extract`, `shared_extract`, `clipped` | The Geofabrik extract, whether it covers several countries, and whether it was clipped |
+| `table_fingerprint`, `build_settings` | Used to decide whether the zip is up to date |
+
+### Settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `OUT_DIR` | `/Volumes/prd_mega/sgpbpi163/vgpbpi163/OSM/osm_road_all_country` | Where zips and the manifest go |
+| `ROWS_PER_PART` | `200_000` | Hard limit of rows per CSV file |
+| `TARGET_ROWS_PER_PART` | `195_000` | Sets the number of parts. The head-room keeps every part under the limit. |
+| `ZIP_COMPRESSION_LEVEL` | `6` | |
+| `CLIP_SHARED_EXTRACTS` | `True` | Clip shared extracts to the country boundary |
+| `BOUNDARY_TABLE` | `prd_mega.sgpbpi163.cbd_world_boundaries_dissolved` | Boundaries (`iso_a3`, `geometry_json`) |
+| `CLIP_BUFFER_DEG` | `0.002` | About 200 m. Keeps coastal roads and causeways the boundary line just misses. |
+| `BOUNDARY_SIMPLIFY_DEG` | `0.0005` | About 50 m. Keeps the boundary small enough to ship to the executors. |
+| `ON_MISSING_BOUNDARY` | `"keep_unclipped"` | If a boundary is missing, publish the whole shared extract and say so in the zip's `README.txt`. `"fail"` skips the country instead. |
+| `FORCE_REBUILD` | `False` | `True` rebuilds every zip even if it is up to date |
+| `PRUNE_MISSING_ZIPS` | `True` | Drop manifest entries whose zip is no longer in the Volume |
+| `BUILD_VERSION` | `1` | Increase it when the zip layout or README changes. It forces a rebuild. |
+| `ONLY_ISO2` | `[]` | Smoke test, as in notebook 01 |
+
+---
+
+## Notebook 03: road coverage in km
+
+`03_osm_roads_coverage_analysis.py` measures how many kilometres of road each country has, split by road kind, and writes one CSV:
+
+`/Volumes/prd_mega/sgpbpi163/vgpbpi163/OSM/geofabrik_country/00_countrywise_road_coverage_analysis.csv`
+
+For every `osm_geofabrik_<iso2>` table it:
+
+1. **Loads the table as a Spark DataFrame.** Shared extracts are clipped to the country boundary with the same rule as notebook 02, so the km match the rows people download.
+2. **Adds the column `kms`**, the length of each road line in kilometres (see [How the length is measured](#how-the-length-is-measured)).
+3. **Groups the roads by `kind`** and sums `kms`.
+4. **Keeps the small per-country result** and moves on. A failed country is reported and left out of the CSV. It never stops the loop.
+
+After the loop the results are combined into one Spark DataFrame with **one row per country**.
+
+### CSV columns
+
+| Column | Description |
+|---|---|
+| `country_iso2` | ISO-2 code |
+| `country_name` | Country name |
+| `total_coverage_km` | Sum over **all** kinds |
+| `primary_km`, `secondary_km`, `tertiary_km` | Always present, right after the total |
+| `<kind>_km` | One column for every other kind found in any country, biggest first: `residential_km`, `service_km`, `track_km`, `tertiary_link_km`, ... |
+
+- A kind that a country does not have is `0`. A country with no primary roads gets `primary_km = 0`.
+- If no country has `primary`, `secondary` or `tertiary`, those columns still exist and hold `0`.
+- A column exists for every kind found in any table, so none is left out. Notebook 01 keeps 16 road types, so expect up to 16 kind columns.
+- Values are in km with 3 decimals (1 m), written as plain decimals.
+- A country whose table has no roads gets a row of zeros.
+
+```python
+import pandas as pd
+
+df = pd.read_csv(
+    "/Volumes/prd_mega/sgpbpi163/vgpbpi163/OSM/geofabrik_country/00_countrywise_road_coverage_analysis.csv",
+    keep_default_na=False,   # otherwise pandas reads Namibia's code "NA" as missing
+)
+```
+
+### How the length is measured
+
+Each road is a WKT `LINESTRING` of (lon, lat) points. For every pair of consecutive points the notebook computes the shortest distance on the WGS84 ellipsoid with `pyproj.Geod(ellps="WGS84").inv(...)` and adds the segments up. The result is a true ground distance, not a length in degrees or in a flat map projection. Lines that cross the 180° meridian are handled correctly. Parts of a multi-part line are measured separately.
+
+References:
+- Karney, C. F. F. (2013), [Algorithms for geodesics](https://link.springer.com/article/10.1007%2Fs00190-012-0578-z), *Journal of Geodesy* 87, 43–55
+- [GeographicLib: Geodesics on an Ellipsoid](https://geographiclib.sourceforge.io/geod.html)
+- [pyproj `Geod` documentation](https://pyproj4.github.io/pyproj/stable/api/geod.html)
+
+### How `kind` is cleaned
+
+Before grouping, `kind` is trimmed and lower-cased, and every run of characters that is not a letter or digit becomes `_`. So `Tertiary-Link`, `tertiary link` and `tertiary_link` all end up in `tertiary_link_km`. A null or empty `kind` becomes `unknown`. The notebook prints every spelling it found and the kind it was merged into.
+
+### Roads without a usable geometry
+
+A road whose geometry is null, empty, unreadable, not a line, or has coordinates outside the valid range has no length. It is left out of the km sums and counted per country in the run output (`without usable geometry`).
+
+### Built-in checks
+
+- `total_coverage_km` equals the sum of all kind columns for every country.
+- There is exactly one row per country and no null values.
+- After writing, the CSV is read back and its header, row count and total are compared with the DataFrame.
+
+### Settings
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `OUT_DIR`, `OUT_NAME` | `.../OSM/geofabrik_country`, `00_countrywise_road_coverage_analysis.csv` | Output location |
+| `CLIP_SHARED_EXTRACTS`, `BOUNDARY_TABLE`, `CLIP_BUFFER_DEG`, `BOUNDARY_SIMPLIFY_DEG` | Same as notebook 02 | Keep them identical to notebook 02 so the numbers match the zips |
+| `ON_MISSING_BOUNDARY` | `"fail"` | If a boundary is missing, the country is skipped and reported, because neighbouring roads would silently inflate its km. `"keep_unclipped"` uses the whole shared extract anyway. |
+| `PRIORITY_KINDS` | `primary`, `secondary`, `tertiary` | Columns placed right after the total |
+| `UNKNOWN_KIND` | `unknown` | Label for null or empty `kind` |
+| `KM_DECIMALS` | `3` | Decimals in the CSV |
+| `ONLY_ISO2` | `[]` | Smoke test. The CSV is overwritten with just these countries. |
+
+Every country is one Spark job, so the largest ones (for example the US, India, China, Indonesia, Russia) take the longest. Notebook 03 has no skip logic and recomputes all countries on every run.
+
+---
+
+## Shared extracts
+
+Geofabrik does not publish an extract for every country. Some are inside a larger extract. In notebook 01, the whole extract is written to the table of every code that uses it, so those tables also hold the neighbouring territories' roads. The run log's `note` column says so.
+
+| Geofabrik extract | Codes that use it |
+|---|---|
+| `gcc-states` | AE, BH, KW, OM, QA, SA |
+| `malaysia-singapore-brunei` | MY, SG, BN |
+| `haiti-and-domrep` | HT, DO |
+| `israel-and-palestine` | IL, PS |
+| `senegal-and-gambia` | SN, GM |
+| `american-oceania` | AS, GU, MP and other US Pacific territories |
+| `ireland-and-northern-ireland` | IE and Northern Ireland (GB) |
+| `indonesia` | ID and TL (East Timor) |
+
+Notebooks 02 and 03 cut these back to the country's own boundary. A road is kept, **in full**, when it touches the country's World Bank boundary (buffered by about 200 m). The raw tables from notebook 01 are not clipped.
+
+---
+
+## Refreshing the data
+
+| Situation | What to do |
+|---|---|
+| Run was interrupted, or some countries failed | Run 01 again. Countries whose table exists are skipped, and failed countries are retried. See the note below about countries that were cut off mid-run. |
+| Refresh one or more countries with the latest Geofabrik data | Drop the table(s), for example `DROP TABLE prd_mega.sgpbpi163.osm_geofabrik_la`. Set `FORCE_DOWNLOAD = True` and `ONLY_ISO2 = ["LA"]` in 01, run it, then run 02 and 03. |
+| Rebuild the zips only | Run 02. It rebuilds only countries whose table changed. Set `FORCE_REBUILD = True` to rebuild all. |
+| Recompute the coverage CSV | Run 03. It always recomputes every country. |
+
+If a run is killed in the middle of a country, for example the cluster is terminated, that country's partly written table remains. The next run of 01 sees the table and skips the country. Drop the table to extract it again. When a country fails normally, notebook 01 drops the partial table itself.
 
 ---
 
@@ -257,43 +358,28 @@ GROUP BY status;
 
 | Symptom | Cause / fix |
 |---|---|
-| `No Overpass endpoint is reachable from this cluster` | The cluster has no outbound internet access, or a firewall is blocking it. Ask the platform team to allow the hosts listed under [Requirements](#requirements). |
-| `Cannot write to /Volumes/...` | The Volume does not exist, or you lack `WRITE VOLUME` on it |
-| Many countries `FAILED` with `rate_limited` or `HTTP 429` | Public servers are busy or you are over their per-IP limit. Wait and `resume`. Lower `country_workers` or `tile_workers_per_country`. |
-| `no healthy Overpass endpoint for 1800s` | All servers were paused at once. This is usually temporary; `resume` later. |
-| A tile fails repeatedly with `too_big` at maximum depth | Extremely dense area. Raise `overpass_timeout_s` (e.g. 300) and `resume`. |
-| Driver memory still high | Lower `write_batch_rows` (e.g. 20,000) and/or `country_workers` |
-| `Table name collision(s)` at start-up | Two countries map to the same name. Set `table_naming = "iso3"`. |
-| `DELTA_CONCURRENT…` messages in the log | Harmless: concurrent Delta commits are retried automatically |
+| `Download failed (wget exit ...)` | The cluster cannot reach `download.geofabrik.de`, or the download broke. Check network access and run 01 again. |
+| `No Geofabrik extract exists for ...` | Geofabrik has no extract for that code. Expected for some small territories. |
+| `Obsolete ISO code ...` | `AN` and `CS` no longer exist. Expected. |
+| `No road features ... found` | The extract has no ways with the road types listed above |
+| A country is skipped as `exists` but looks incomplete | A run was cut off. Drop the table and run 01 again. |
+| 02 or 03: `no boundary for XXX in ...cbd_world_boundaries_dissolved` | The boundary table has no row for that `iso_a3`. 02 publishes the whole extract and notes it (a warning). 03 skips the country (an error). Add the boundary and re-run. |
+| 02: `Row check failed` or `A part has ... rows` | The CSV parts do not add up to the table. The previous zip stays published. Re-run 02 for that country with `FORCE_REBUILD = True`. |
+| 03: a country is missing from the CSV | It failed. The run summary lists it under `FAILED` with the reason. |
+| 03: the CSV has only a few countries | `ONLY_ISO2` was set. Clear it and run again. |
+| Local disk full in 01 | The PBF of a large country does not fit on the driver. Use a cluster with more local disk. |
 
 ---
 
 ## Known limitations
 
-- **Border roads appear in both countries.** A way crossing a border is inside both countries' areas. Deduplicate on `osm_id` when combining countries, e.g. in the `osm_road_all` view.
-- **Overlapping territories.** Some OSM country boundaries contain other ISO territories. For example, France (`FR`) includes its overseas departments (`GF`, `RE`, `GP`, `MQ`, `YT`), so their roads appear in both tables.
-- **What "edited since" means.** The `newer:` filter uses the way's own timestamp. It changes when the way's tags or node list change, but **not** when one of its nodes is moved. A road whose geometry was only adjusted by moving nodes is therefore not included. Ways deleted after `since_date` are not listed at all.
-- **Snapshot time.** Each tile's data reflects the Overpass database at the moment it was queried; the time is saved in `osm_road_tile_log.osm_base`. Tiles in one country may be minutes to hours apart.
-- **Tile skipping near coasts.** Very small, remote islands more than about 28 km (0.25°) from the simplified outline of a large country could be skipped by tile pruning.
-- **Antarctica (`AQ`).** If no boundary relation is found, a hard-coded bounding box is used without an area filter, so this can take a while.
-- **Runtime.** A full run covering all countries since 2024 takes many hours, mostly waiting on the public Overpass servers. Please respect their [usage policy](https://wiki.openstreetmap.org/wiki/Overpass_API#Public_Overpass_API_instances) and keep the default concurrency.
+- **Snapshot date.** Data is as of the day the Geofabrik extract was built. The Volume keeps the PBF it downloaded first, so with `FORCE_DOWNLOAD = False` the data can be older than today's `-latest`. `source_year` is the year the notebook ran, not the year of the data.
+- **Roads only.** Only the 16 road types listed under [Notebook 01](#notebook-01-extract-roads-into-tables) are kept.
+- **Border roads.** A road that crosses a border can be counted for both neighbouring countries. The boundary clip in notebooks 02 and 03 keeps whole roads that touch the boundary instead of cutting them at the border.
+- **Northern Ireland.** The raw `IE` table from notebook 01 includes Northern Ireland, because it comes from a shared extract. Notebooks 02 and 03 clip `IE` to the Republic of Ireland.
+- **Distances are along the ground.** Lengths ignore elevation and are measured on the ellipsoid.
+- **Countries without an extract.** Some small territories have no Geofabrik extract. They are logged as failures in 01 and do not appear in the outputs of 02 and 03.
 
 ---
 
-## Changes from the previous notebook
-
-| Previous | Now |
-|---|---|
-| All GeoDataFrames kept in `all_gdfs`, which caused OOM (exit 137) | Streamed to disk, parsed incrementally, written in batches; one table and CSV per country |
-| Whole-country queries with a 120 s timeout | 2° tiles that split automatically when too heavy |
-| Timeout `remark` ignored, so failures showed as "no data" | Remarks and truncation detected; failures are logged, never reported as empty |
-| Countries looked up by name via Nominatim (failed for BO, BQ, CD, …) | Looked up by ISO code; queried by OSM area |
-| Mirror list defined but never used | Health-checked endpoint pool with fail-over and cool-downs |
-| `osm_timestamp` always null (`out body`) | Populated (`out meta`) |
-| Lengths in EPSG:3857, inflated by 1/cos(latitude) | Geodesic lengths on WGS84 |
-| Excel export (`spark_df.to_excel` does not exist; 1M-row cap) | CSV export to a UC Volume, split at 1M rows per file |
-| A crash lost all progress | Per-tile and per-country checkpoints with `resume` |
-
----
-
-*Data © OpenStreetMap contributors, available under the [Open Database License (ODbL)](https://www.openstreetmap.org/copyright). Outputs derived from OSM must carry this attribution.*
+*Data © OpenStreetMap contributors, available under the [Open Database License (ODbL)](https://www.openstreetmap.org/copyright). Extracts are provided by [Geofabrik](https://download.geofabrik.de). Outputs derived from OSM must carry this attribution.*
